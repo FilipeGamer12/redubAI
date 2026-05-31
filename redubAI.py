@@ -217,20 +217,29 @@ def parse_srt(path: Path) -> list[Segment]:
 # Extração de áudio
 # ----------------------------
 
-def extract_audio(video_path: Path, wav_path: Path) -> None:
+def extract_audio(
+    video_path: Path,
+    wav_path: Path,
+    *,
+    channels: int = 1,
+    sample_rate: int = 16000,
+) -> None:
     ensure_command_exists("ffmpeg")
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-vn",
-        "-ac", "1",
-        "-ar", "16000",
+        "-ac", str(channels),
+        "-ar", str(sample_rate),
         "-c:a", "pcm_s16le",
         str(wav_path),
     ]
-    info("Extraindo áudio do vídeo...")
+    info(
+        "Extraindo áudio do vídeo..."
+        if channels == 1 and sample_rate == 16000
+        else f"Extraindo áudio do vídeo para mixagem ({channels} canais, {sample_rate} Hz)..."
+    )
     run(cmd)
-
 
 # ----------------------------
 # Whisper / ASR com escolha de dispositivo
@@ -251,11 +260,21 @@ def transcribe_with_whisper(
     try:
         # Para CPU, fp16 pode causar problemas, então desabilitar
         use_fp16 = (device == "cuda")
+
+        # Parâmetros mais conservadores ajudam a reduzir cortes ruins
+        # e trechos espúrios de silêncio.
         result = model.transcribe(
             str(wav_path),
             task="transcribe",
             verbose=False,
             fp16=use_fp16,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.55,
+            best_of=5,
+            beam_size=5,
         )
     finally:
         info("Descarregando Whisper da memória...")
@@ -283,6 +302,120 @@ def transcribe_with_whisper(
         die("Nenhum segmento válido foi produzido pela transcrição.")
 
     return segments
+
+
+# ----------------------------
+# Refinamento temporal dos segmentos
+# ----------------------------
+
+def refine_segments_with_audio(
+    segments: list[Segment],
+    audio_path: Path,
+    *,
+    pre_roll_sec: float = 0.20,
+    post_roll_sec: float = 0.18,
+    min_silence_len_ms: int = 120,
+    edge_pad_sec: float = 0.06,
+    search_shifts: tuple[float, ...] = (0.0, -3.0, -6.0, -9.0),
+) -> list[Segment]:
+    """
+    Refina as bordas dos segmentos usando detecção de trechos não silenciosos
+    no áudio original. Isso reduz os casos em que o TTS entra antes da fala real.
+    """
+    from pydub import AudioSegment
+    from pydub.silence import detect_nonsilent
+
+    if not segments:
+        return []
+
+    if not audio_path.exists():
+        return segments
+
+    audio = AudioSegment.from_file(str(audio_path))
+    audio_ms = len(audio)
+    if audio_ms <= 0:
+        return segments
+
+    refined: list[Segment] = []
+
+    def clamp_ms(value: float) -> int:
+        return max(0, min(audio_ms, int(round(value * 1000))))
+
+    for seg in segments:
+        original_start_ms = clamp_ms(seg.start)
+        original_end_ms = clamp_ms(seg.end)
+        if original_end_ms <= original_start_ms:
+            refined.append(seg)
+            continue
+
+        window_start_ms = max(0, int(round((seg.start - pre_roll_sec) * 1000)))
+        window_end_ms = min(audio_ms, int(round((seg.end + post_roll_sec) * 1000)))
+        if window_end_ms <= window_start_ms:
+            refined.append(seg)
+            continue
+
+        window = audio[window_start_ms:window_end_ms]
+        if len(window) < 80:
+            refined.append(seg)
+            continue
+
+        # Baseado no nível do próprio trecho; se estiver muito baixo,
+        # sobe um pouco a sensibilidade para ainda capturar fala.
+        base = window.dBFS
+        if base == float("-inf"):
+            silence_thresh_candidates = (-42.0, -45.0, -48.0)
+        else:
+            silence_thresh_candidates = tuple(
+                max(-50.0, min(-18.0, base - 14.0 + shift)) for shift in search_shifts
+            )
+
+        nonsilent = []
+        for silence_thresh in silence_thresh_candidates:
+            try:
+                nonsilent = detect_nonsilent(
+                    window,
+                    min_silence_len=min_silence_len_ms,
+                    silence_thresh=silence_thresh,
+                    seek_step=10,
+                )
+            except Exception:
+                nonsilent = []
+            if nonsilent:
+                break
+
+        if not nonsilent:
+            # Pequeno fallback: se o Whisper já veio justo, mantém o segmento original.
+            refined.append(seg)
+            continue
+
+        first_start_ms, _ = nonsilent[0]
+        _, last_end_ms = nonsilent[-1]
+
+        new_start_sec = max(0.0, (window_start_ms + first_start_ms) / 1000.0 - edge_pad_sec)
+        new_end_sec = min(audio_ms / 1000.0, (window_start_ms + last_end_ms) / 1000.0 + edge_pad_sec)
+
+        # Garante que o segmento não encolha demais.
+        if new_end_sec - new_start_sec < 0.15:
+            refined.append(seg)
+            continue
+
+        refined.append(
+            Segment(
+                index=seg.index,
+                start=new_start_sec,
+                end=new_end_sec,
+                text=seg.text,
+                translated_text=seg.translated_text,
+                tts_file=seg.tts_file,
+                tts_duration=seg.tts_duration,
+            )
+        )
+
+    # Reindexa por segurança.
+    for i, seg in enumerate(refined, start=1):
+        seg.index = i
+
+    return refined
 
 
 # ----------------------------
@@ -552,22 +685,55 @@ def fit_audio_to_duration(
     audio.export(str(output_audio), format="wav")
 
 
-def build_dub_track(
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+
+    intervals = sorted((max(0, start), max(0, end)) for start, end in intervals if end > start)
+    merged: list[tuple[int, int]] = [intervals[0]]
+
+    for start, end in intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def build_documentary_mix_track(
     segments: list[Segment],
     *,
+    source_audio: Path,
     tts_dir: Path,
-    dub_wav: Path,
+    mix_wav: Path,
     voice: str,
     total_duration_sec: float,
+    duck_volume: float = 0.05,  # ducking bem mais agressivo para destacar a voz TTS
+    tts_lead_in_sec: float = 0.05,
+    tts_delay_compensation_sec: float = 0.00,
 ) -> None:
     from pydub import AudioSegment
 
     tts_dir.mkdir(parents=True, exist_ok=True)
 
-    timeline = AudioSegment.silent(
-        duration=int(math.ceil(total_duration_sec * 1000)),
-        frame_rate=48000
-    ).set_channels(2)
+    original_audio = AudioSegment.from_file(str(source_audio))
+    original_audio = original_audio.set_frame_rate(48000).set_channels(2)
+
+    target_ms = max(1, int(math.ceil(total_duration_sec * 1000)))
+    if len(original_audio) < target_ms:
+        original_audio = original_audio + AudioSegment.silent(
+            duration=target_ms - len(original_audio),
+            frame_rate=original_audio.frame_rate,
+        )
+    elif len(original_audio) > target_ms:
+        original_audio = original_audio[:target_ms]
+
+    # Reduz bastante o áudio original enquanto houver TTS.
+    duck_gain_db = 20.0 * math.log10(max(0.0001, duck_volume))
+    ducked_intervals: list[tuple[int, int]] = []
+    tts_entries: list[tuple[int, AudioSegment]] = []
 
     for seg in segments:
         translated = clean_text(seg.translated_text)
@@ -586,10 +752,50 @@ def build_dub_track(
         tts_audio = AudioSegment.from_file(str(fitted_wav))
         seg.tts_duration = len(tts_audio) / 1000.0
 
-        start_ms = int(round(seg.start * 1000))
-        timeline = timeline.overlay(tts_audio, position=start_ms)
+        # Compensa pequenas antecipações do texto e evita sobreposição agressiva
+        # no exato início da fala detectada.
+        start_ms = max(0, int(round((seg.start + tts_delay_compensation_sec) * 1000)))
+        duck_start_ms = max(0, int(round((seg.start - tts_lead_in_sec) * 1000)))
+        duck_end_ms = min(target_ms, start_ms + len(tts_audio) + int(round(tts_lead_in_sec * 1000)))
 
-    timeline.export(str(dub_wav), format="wav")
+        if duck_end_ms > duck_start_ms:
+            ducked_intervals.append((duck_start_ms, duck_end_ms))
+
+        tts_entries.append((start_ms, tts_audio))
+
+    merged_intervals = merge_intervals(ducked_intervals)
+
+    pieces: list[AudioSegment] = []
+    cursor = 0
+    for start_ms, end_ms in merged_intervals:
+        start_ms = max(0, min(start_ms, target_ms))
+        end_ms = max(0, min(end_ms, target_ms))
+        if start_ms > cursor:
+            pieces.append(original_audio[cursor:start_ms])
+        if end_ms > start_ms:
+            pieces.append(original_audio[start_ms:end_ms].apply_gain(duck_gain_db))
+        cursor = max(cursor, end_ms)
+
+    if cursor < len(original_audio):
+        pieces.append(original_audio[cursor:target_ms])
+
+    if pieces:
+        mix = pieces[0]
+        for piece in pieces[1:]:
+            mix += piece
+    else:
+        mix = original_audio
+
+    for start_ms, tts_audio in tts_entries:
+        if start_ms + len(tts_audio) > len(mix):
+            mix = mix + AudioSegment.silent(
+                duration=(start_ms + len(tts_audio)) - len(mix),
+                frame_rate=mix.frame_rate,
+            )
+        mix = mix.overlay(tts_audio, position=start_ms)
+
+    mix = mix.set_frame_rate(48000).set_channels(2)
+    mix.export(str(mix_wav), format="wav")
 
 
 def convert_wav_to_m4a(input_wav: Path, output_m4a: Path) -> None:
@@ -607,26 +813,24 @@ def convert_wav_to_m4a(input_wav: Path, output_m4a: Path) -> None:
 
 def mux_into_mkv(
     original_video: Path,
-    dub_audio_m4a: Path,
+    mix_audio_m4a: Path,
     output_video: Path,
 ) -> None:
     ensure_command_exists("ffmpeg")
-    original_audio_count = count_audio_streams(original_video)
-    dub_audio_index = original_audio_count
     cmd = [
         "ffmpeg", "-y",
         "-i", str(original_video),
-        "-i", str(dub_audio_m4a),
+        "-i", str(mix_audio_m4a),
         "-map", "0",
+        "-map", "-0:a",
         "-map", "1:a:0",
         "-c", "copy",
-        "-metadata:s:a:%d" % dub_audio_index, "language=por",
-        "-metadata:s:a:%d" % dub_audio_index, "title=Dublagem PT-BR",
+        "-metadata:s:a:0", "language=por",
+        "-metadata:s:a:0", "title=Dublagem PT-BR",
         str(output_video),
     ]
-    info("Muxando MKV final com faixa de áudio adicional...")
+    info("Muxando MKV final com uma única faixa de áudio dublada...")
     run(cmd)
-
 
 # ----------------------------
 # Pipeline principal
@@ -646,9 +850,8 @@ def process_video(
     original_srt: Optional[Path] = None,
     skip_translation: bool = False,
     translated_srt: Optional[Path] = None,
-    device: str = "cuda",  # novo parâmetro
+    device: str = "cuda",
 ) -> None:
-    # Configura o dispositivo (valida e exibe info)
     device = setup_device(device)
 
     if not input_video.exists():
@@ -676,19 +879,23 @@ def process_video(
 
     try:
         segments: list[Segment] = []
+        transcribe_audio_path: Optional[Path] = None
 
         if skip_transcription:
             if not original_srt or not original_srt.exists():
                 die("--skip-transcription requer um SRT original válido via --original-srt")
             info(f"Usando SRT original fornecido: {original_srt}")
             segments = parse_srt(original_srt)
-            total_duration_sec = probe_duration_seconds(input_video)
-            if total_duration_sec <= 0:
-                total_duration_sec = max((s.end for s in segments), default=0.0)
         else:
-            audio_wav = workdir / "audio.wav"
-            extract_audio(input_video, audio_wav)
+            audio_wav = workdir / "audio_transcribe.wav"
+            extract_audio(input_video, audio_wav, channels=1, sample_rate=16000)
+            transcribe_audio_path = audio_wav
             segments = transcribe_with_whisper(audio_wav, asr_model=asr_model, device=device)
+
+            # Refina as bordas dos segmentos com base no áudio original,
+            # melhorando a correspondência entre legenda e fala real.
+            segments = refine_segments_with_audio(segments, audio_wav)
+
             original_srt_path = script_dir / "original.srt"
             write_srt(original_srt_path, segments, translated=False)
             info(f"SRT original salvo em: {original_srt_path}")
@@ -703,7 +910,6 @@ def process_video(
                 base_url=ollama_url,
             )
             translations = translator.translate_full_srt(segments)
-            # Atribui as traduções aos segmentos
             for seg, trans in zip(segments, translations):
                 seg.translated_text = trans
 
@@ -715,16 +921,13 @@ def process_video(
                 die("--skip-translation requer um SRT traduzido válido via --translated-srt")
             info(f"Usando SRT traduzido fornecido: {translated_srt}")
             translated_segments = parse_srt(translated_srt)
-            if skip_transcription:
-                segments = translated_segments
-            else:
-                if len(segments) != len(translated_segments):
-                    die(
-                        f"Número de segmentos original ({len(segments)}) diferente do traduzido "
-                        f"({len(translated_segments)}). Impossível combinar."
-                    )
-                for orig, trans in zip(segments, translated_segments):
-                    orig.translated_text = trans.text
+            if len(segments) != len(translated_segments):
+                die(
+                    f"Número de segmentos original ({len(segments)}) diferente do traduzido "
+                    f"({len(translated_segments)}). Impossível combinar."
+                )
+            for orig, trans in zip(segments, translated_segments):
+                orig.translated_text = trans.text
 
         if not segments or all(not clean_text(s.translated_text) for s in segments):
             die("Nenhum segmento com tradução disponível para gerar áudio.")
@@ -733,27 +936,28 @@ def process_video(
         if total_duration_sec <= 0:
             total_duration_sec = max((s.end for s in segments), default=0.0)
 
-        dub_wav = workdir / "dub_track.wav"
-        dub_m4a = workdir / "dub_track.m4a"
+        mix_source_wav = workdir / "audio_mix.wav"
+        extract_audio(input_video, mix_source_wav, channels=2, sample_rate=48000)
+
+        mix_wav = workdir / "dub_track.wav"
+        mix_m4a = workdir / "dub_track.m4a"
         tts_dir = workdir / "tts"
 
-        build_dub_track(
+        build_documentary_mix_track(
             segments,
+            source_audio=mix_source_wav,
             tts_dir=tts_dir,
-            dub_wav=dub_wav,
+            mix_wav=mix_wav,
             voice=voice,
             total_duration_sec=total_duration_sec,
         )
 
-        convert_wav_to_m4a(dub_wav, dub_m4a)
+        convert_wav_to_m4a(mix_wav, mix_m4a)
 
         output_video.parent.mkdir(parents=True, exist_ok=True)
-        mux_into_mkv(input_video, dub_m4a, output_video)
+        mux_into_mkv(input_video, mix_m4a, output_video)
 
         info(f"Concluído: {output_video}")
-
-        if not keep_temp and temp_dir is None and tmp_obj is not None:
-            tmp_obj.cleanup()
 
     except Exception as exc:
         die(f"Falha no pipeline: {exc}")
@@ -764,6 +968,7 @@ def process_video(
 # ----------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
+
     p = argparse.ArgumentParser(
         description="Sistema de redublagem automática com IA para vídeos MKV."
     )
